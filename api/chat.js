@@ -1,6 +1,20 @@
 // Serverless function that proxies chat requests to Gemini
 // The API key stays on the server, never exposed to the browser
 
+// Best-effort in-memory rate limit. Resets on cold start and isn't shared
+// across concurrent instances, but it still blunts casual abuse of the key.
+const RATE_LIMIT = 15; // requests
+const RATE_WINDOW_MS = 60_000;
+const hits = new Map();
+
+function isRateLimited(ip) {
+  const now = Date.now();
+  const timestamps = (hits.get(ip) || []).filter(t => now - t < RATE_WINDOW_MS);
+  timestamps.push(now);
+  hits.set(ip, timestamps);
+  return timestamps.length > RATE_LIMIT;
+}
+
 export default async function handler(req, res) {
   // Only allow POST
   if (req.method !== 'POST') {
@@ -12,10 +26,19 @@ export default async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
 
+  const ip = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.socket?.remoteAddress || 'unknown';
+  if (isRateLimited(ip)) {
+    return res.status(429).json({ error: 'Too many requests — please slow down.' });
+  }
+
   try {
+    if (!req.body || typeof req.body !== 'object') {
+      return res.status(400).json({ error: 'Invalid request body' });
+    }
+
     const { message } = req.body;
 
-    if (!message || typeof message !== 'string') {
+    if (!message || typeof message !== 'string' || !message.trim()) {
       return res.status(400).json({ error: 'Missing message' });
     }
 
@@ -24,7 +47,7 @@ export default async function handler(req, res) {
       return res.status(400).json({ error: 'Message too long' });
     }
 
-    const systemPrompt = `You are Cecil, a Master Cicerone and world-class spirits expert with 30+ years of experience. You are the AI expert inside the Pinteria beer crafting game app.
+    const systemPrompt = `You are Cecil, a Master Cicerone and world-class spirits expert with 30+ years of experience. You are the AI expert inside the Pinteria app.
 
 You have deep expert knowledge of:
 - All beer styles (lagers, ales, IPAs, stouts, sours, wheat beers, Belgians, porters, etc.)
@@ -42,36 +65,45 @@ You have deep expert knowledge of:
 
 Your personality: warm, passionate, a little opinionated (in a fun way), uses rich descriptive language. You love sharing knowledge. Occasionally use relevant emoji. Keep answers focused and useful, not too long unless the question demands depth. Format with **bold** for key terms when helpful.`;
 
-    const geminiResponse = await fetch(
-      'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent',
-      {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'x-goog-api-key': process.env.GEMINI_API_KEY,
-        },
-        body: JSON.stringify({
-          system_instruction: {
-            parts: [{ text: systemPrompt }]
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 20_000);
+
+    let geminiResponse;
+    try {
+      geminiResponse = await fetch(
+        'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent',
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'x-goog-api-key': process.env.GEMINI_API_KEY,
           },
-          contents: [
-            {
-              role: 'user',
-              parts: [{ text: message }]
+          body: JSON.stringify({
+            system_instruction: {
+              parts: [{ text: systemPrompt }]
+            },
+            contents: [
+              {
+                role: 'user',
+                parts: [{ text: message }]
+              }
+            ],
+            generationConfig: {
+              maxOutputTokens: 1000,
+              temperature: 0.8
             }
-          ],
-          generationConfig: {
-            maxOutputTokens: 1000,
-            temperature: 0.8
-          }
-        })
-      }
-    );
+          }),
+          signal: controller.signal
+        }
+      );
+    } finally {
+      clearTimeout(timeoutId);
+    }
 
     if (!geminiResponse.ok) {
       const errText = await geminiResponse.text();
       console.error('Gemini API error:', errText);
-      return res.status(500).json({ error: 'AI service unavailable' });
+      return res.status(502).json({ error: 'AI service unavailable' });
     }
 
     const data = await geminiResponse.json();
@@ -79,6 +111,10 @@ Your personality: warm, passionate, a little opinionated (in a fun way), uses ri
 
     return res.status(200).json({ text });
   } catch (err) {
+    if (err.name === 'AbortError') {
+      console.error('Gemini request timed out');
+      return res.status(504).json({ error: 'AI service timed out' });
+    }
     console.error('Handler error:', err);
     return res.status(500).json({ error: 'Server error' });
   }
